@@ -1423,6 +1423,16 @@ func (c *ClusterClient) cmdsMoved(
 	return nil
 }
 
+// NewTransation returns a transaction, the related slot is determined by key.
+func (c *ClusterClient) NewTransation(ctx context.Context, key string) (*Tx, error) {
+	slot := hashtag.Slot(key)
+	node, err := c.slotMasterNode(ctx, slot)
+	if err != nil {
+		return nil, err
+	}
+	return node.Client.newTx(ctx), nil
+}
+
 func (c *ClusterClient) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) error {
 	if len(keys) == 0 {
 		return fmt.Errorf("redis: Watch requires at least one key")

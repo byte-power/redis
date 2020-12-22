@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8/internal"
+	"github.com/go-redis/redis/v8/internal/hashtag"
 	"github.com/go-redis/redis/v8/internal/pool"
 	"github.com/go-redis/redis/v8/internal/proto"
 	"go.opentelemetry.io/otel/label"
@@ -789,4 +790,17 @@ func (c *Conn) TxPipeline() Pipeliner {
 	}
 	pipe.init()
 	return &pipe
+}
+
+func AreKeysInSameSlot(keys ...string) bool {
+	if len(keys) == 0 {
+		return true
+	}
+	slot := hashtag.Slot(keys[0])
+	for _, key := range keys[1:] {
+		if hashtag.Slot(key) != slot {
+			return false
+		}
+	}
+	return true
 }
