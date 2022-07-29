@@ -1414,7 +1414,7 @@ func (c *ClusterClient) NewTransation(ctx context.Context, key string) (*Tx, err
 	if err != nil {
 		return nil, err
 	}
-	return node.Client.newTx(ctx), nil
+	return node.Client.newTx(), nil
 }
 
 func (c *ClusterClient) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) error {
