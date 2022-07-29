@@ -1,14 +1,18 @@
-module github.com/go-redis/redis/example
+module github.com/go-redis/redis/example/otel
 
 go 1.14
 
-require (
-	github.com/benbjohnson/clock v1.0.3 // indirect
-	github.com/go-redis/redis/v8 v8.3.0
-	github.com/opentracing/opentracing-go v1.1.1-0.20190913142402-a7454ce5950e // indirect
-	go.opentelemetry.io/otel v0.14.0
-	go.opentelemetry.io/otel/sdk v0.14.0
-	google.golang.org/genproto v0.0.0-20191009194640-548a555dbc03 // indirect
-)
+replace github.com/go-redis/redis/v9 => ../..
 
-replace github.com/go-redis/redis/v8 => ../../
+replace github.com/go-redis/redis/extra/redisotel/v9 => ../../extra/redisotel
+
+replace github.com/go-redis/redis/extra/rediscmd/v9 => ../../extra/rediscmd
+
+require (
+	github.com/go-redis/redis/extra/redisotel/v9 v9.0.0-beta.2
+	github.com/go-redis/redis/v9 v9.0.0-beta.2
+	github.com/uptrace/opentelemetry-go-extra/otelplay v0.1.15
+	go.opentelemetry.io/otel v1.8.0
+	golang.org/x/net v0.0.0-20220728030405-41545e8bf201 // indirect
+	google.golang.org/genproto v0.0.0-20220725144611-272f38e5d71b // indirect
+)

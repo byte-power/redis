@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/go-redis/redis/v9"
 )
 
 func benchmarkRedisClient(ctx context.Context, poolSize int) *redis.Client {
@@ -27,18 +29,42 @@ func benchmarkRedisClient(ctx context.Context, poolSize int) *redis.Client {
 
 func BenchmarkRedisPing(b *testing.B) {
 	ctx := context.Background()
-	client := benchmarkRedisClient(ctx, 10)
-	defer client.Close()
+	rdb := benchmarkRedisClient(ctx, 10)
+	defer rdb.Close()
 
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if err := client.Ping(ctx).Err(); err != nil {
+			if err := rdb.Ping(ctx).Err(); err != nil {
 				b.Fatal(err)
 			}
 		}
 	})
+}
+
+func BenchmarkSetGoroutines(b *testing.B) {
+	ctx := context.Background()
+	rdb := benchmarkRedisClient(ctx, 10)
+	defer rdb.Close()
+
+	for i := 0; i < b.N; i++ {
+		var wg sync.WaitGroup
+
+		for i := 0; i < 1000; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				err := rdb.Set(ctx, "hello", "world", 0).Err()
+				if err != nil {
+					panic(err)
+				}
+			}()
+		}
+
+		wg.Wait()
+	}
 }
 
 func BenchmarkRedisGetNil(b *testing.B) {
@@ -197,7 +223,7 @@ func BenchmarkZAdd(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			err := client.ZAdd(ctx, "key", &redis.Z{
+			err := client.ZAdd(ctx, "key", redis.Z{
 				Score:  float64(1),
 				Member: "hello",
 			}).Err()
@@ -208,34 +234,43 @@ func BenchmarkZAdd(b *testing.B) {
 	})
 }
 
-var clientSink *redis.Client
-
-func BenchmarkWithContext(b *testing.B) {
+func BenchmarkXRead(b *testing.B) {
 	ctx := context.Background()
-	rdb := benchmarkRedisClient(ctx, 10)
-	defer rdb.Close()
+	client := benchmarkRedisClient(ctx, 10)
+	defer client.Close()
 
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		clientSink = rdb.WithContext(ctx)
+	args := redis.XAddArgs{
+		Stream: "1",
+		ID:     "*",
+		Values: map[string]string{"uno": "dos"},
 	}
-}
 
-var ringSink *redis.Ring
-
-func BenchmarkRingWithContext(b *testing.B) {
-	ctx := context.Background()
-	rdb := redis.NewRing(&redis.RingOptions{})
-	defer rdb.Close()
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		ringSink = rdb.WithContext(ctx)
+	lenStreams := 16
+	streams := make([]string, 0, lenStreams)
+	for i := 0; i < lenStreams; i++ {
+		streams = append(streams, strconv.Itoa(i))
 	}
+	for i := 0; i < lenStreams; i++ {
+		streams = append(streams, "0")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			client.XAdd(ctx, &args)
+
+			err := client.XRead(ctx, &redis.XReadArgs{
+				Streams: streams,
+				Count:   1,
+				Block:   time.Second,
+			}).Err()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 //------------------------------------------------------------------------------
@@ -276,6 +311,32 @@ func BenchmarkClusterPing(b *testing.B) {
 	})
 }
 
+func BenchmarkClusterDoInt(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping in short mode")
+	}
+
+	ctx := context.Background()
+	cluster := newClusterScenario()
+	if err := startCluster(ctx, cluster); err != nil {
+		b.Fatal(err)
+	}
+	defer cluster.Close()
+
+	client := cluster.newClusterClient(ctx, redisClusterOptions())
+	defer client.Close()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			err := client.Do(ctx, "SET", 10, 10).Err()
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func BenchmarkClusterSetString(b *testing.B) {
 	if testing.Short() {
 		b.Skip("skipping in short mode")
@@ -303,19 +364,4 @@ func BenchmarkClusterSetString(b *testing.B) {
 			}
 		}
 	})
-}
-
-var clusterSink *redis.ClusterClient
-
-func BenchmarkClusterWithContext(b *testing.B) {
-	ctx := context.Background()
-	rdb := redis.NewClusterClient(&redis.ClusterOptions{})
-	defer rdb.Close()
-
-	b.ResetTimer()
-	b.ReportAllocs()
-
-	for i := 0; i < b.N; i++ {
-		clusterSink = rdb.WithContext(ctx)
-	}
 }

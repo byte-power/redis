@@ -12,11 +12,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis/v8/internal"
-	"github.com/go-redis/redis/v8/internal/hashtag"
-	"github.com/go-redis/redis/v8/internal/pool"
-	"github.com/go-redis/redis/v8/internal/proto"
-	"github.com/go-redis/redis/v8/internal/rand"
+	"github.com/go-redis/redis/v9/internal"
+	"github.com/go-redis/redis/v9/internal/hashtag"
+	"github.com/go-redis/redis/v9/internal/pool"
+	"github.com/go-redis/redis/v9/internal/proto"
+	"github.com/go-redis/redis/v9/internal/rand"
 )
 
 var errClusterNoNodes = fmt.Errorf("redis: cluster has no nodes")
@@ -68,13 +68,16 @@ type ClusterOptions struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
+	// PoolFIFO uses FIFO mode for each node connection pool GET/PUT (default LIFO).
+	PoolFIFO bool
+
 	// PoolSize applies per cluster node and not for the whole cluster.
-	PoolSize           int
-	MinIdleConns       int
-	MaxConnAge         time.Duration
-	PoolTimeout        time.Duration
-	IdleTimeout        time.Duration
-	IdleCheckFrequency time.Duration
+	PoolSize        int
+	PoolTimeout     time.Duration
+	MinIdleConns    int
+	MaxIdleConns    int
+	ConnMaxIdleTime time.Duration
+	ConnMaxLifetime time.Duration
 
 	TLSConfig *tls.Config
 }
@@ -86,12 +89,12 @@ func (opt *ClusterOptions) init() {
 		opt.MaxRedirects = 3
 	}
 
-	if (opt.RouteByLatency || opt.RouteRandomly) && opt.ClusterSlots == nil {
+	if opt.RouteByLatency || opt.RouteRandomly {
 		opt.ReadOnly = true
 	}
 
 	if opt.PoolSize == 0 {
-		opt.PoolSize = 5 * runtime.NumCPU()
+		opt.PoolSize = 5 * runtime.GOMAXPROCS(0)
 	}
 
 	switch opt.ReadTimeout {
@@ -129,8 +132,6 @@ func (opt *ClusterOptions) init() {
 }
 
 func (opt *ClusterOptions) clientOptions() *Options {
-	const disableIdleCheck = -1
-
 	return &Options{
 		Dialer:    opt.Dialer,
 		OnConnect: opt.OnConnect,
@@ -146,16 +147,21 @@ func (opt *ClusterOptions) clientOptions() *Options {
 		ReadTimeout:  opt.ReadTimeout,
 		WriteTimeout: opt.WriteTimeout,
 
-		PoolSize:           opt.PoolSize,
-		MinIdleConns:       opt.MinIdleConns,
-		MaxConnAge:         opt.MaxConnAge,
-		PoolTimeout:        opt.PoolTimeout,
-		IdleTimeout:        opt.IdleTimeout,
-		IdleCheckFrequency: disableIdleCheck,
-
-		readOnly: opt.ReadOnly,
+		PoolFIFO:        opt.PoolFIFO,
+		PoolSize:        opt.PoolSize,
+		PoolTimeout:     opt.PoolTimeout,
+		MinIdleConns:    opt.MinIdleConns,
+		MaxIdleConns:    opt.MaxIdleConns,
+		ConnMaxIdleTime: opt.ConnMaxIdleTime,
+		ConnMaxLifetime: opt.ConnMaxLifetime,
 
 		TLSConfig: opt.TLSConfig,
+		// If ClusterSlots is populated, then we probably have an artificial
+		// cluster whose nodes are not in clustering mode (otherwise there isn't
+		// much use for ClusterSlots config).  This means we cannot execute the
+		// READONLY command against that node -- setting readOnly to false in such
+		// situations in the options below will prevent that from happening.
+		readOnly: opt.ReadOnly && opt.ClusterSlots == nil,
 	}
 }
 
@@ -196,15 +202,26 @@ func (n *clusterNode) updateLatency() {
 	const numProbe = 10
 	var dur uint64
 
+	successes := 0
 	for i := 0; i < numProbe; i++ {
 		time.Sleep(time.Duration(10+rand.Intn(10)) * time.Millisecond)
 
 		start := time.Now()
-		n.Client.Ping(context.TODO())
-		dur += uint64(time.Since(start) / time.Microsecond)
+		err := n.Client.Ping(context.TODO()).Err()
+		if err == nil {
+			dur += uint64(time.Since(start) / time.Microsecond)
+			successes++
+		}
 	}
 
-	latency := float64(dur) / float64(numProbe)
+	var latency float64
+	if successes == 0 {
+		// If none of the pings worked, set latency to some arbitrarily high value so this node gets
+		// least priority.
+		latency = float64((1 * time.Minute) / time.Microsecond)
+	} else {
+		latency = float64(dur) / float64(successes)
+	}
 	atomic.StoreUint32(&n.latency, uint32(latency+0.5))
 }
 
@@ -291,8 +308,9 @@ func (c *clusterNodes) Close() error {
 
 func (c *clusterNodes) Addrs() ([]string, error) {
 	var addrs []string
+
 	c.mu.RLock()
-	closed := c.closed
+	closed := c.closed //nolint:ifshort
 	if !closed {
 		if len(c.activeAddrs) > 0 {
 			addrs = c.activeAddrs
@@ -343,7 +361,7 @@ func (c *clusterNodes) GC(generation uint32) {
 	}
 }
 
-func (c *clusterNodes) Get(addr string) (*clusterNode, error) {
+func (c *clusterNodes) GetOrCreate(addr string) (*clusterNode, error) {
 	node, err := c.get(addr)
 	if err != nil {
 		return nil, err
@@ -407,7 +425,7 @@ func (c *clusterNodes) Random() (*clusterNode, error) {
 	}
 
 	n := rand.Intn(len(addrs))
-	return c.Get(addrs[n])
+	return c.GetOrCreate(addrs[n])
 }
 
 //------------------------------------------------------------------------------
@@ -465,7 +483,7 @@ func newClusterState(
 				addr = replaceLoopbackHost(addr, originHost)
 			}
 
-			node, err := c.nodes.Get(addr)
+			node, err := c.nodes.GetOrCreate(addr)
 			if err != nil {
 				return nil, err
 			}
@@ -586,8 +604,16 @@ func (c *clusterState) slotRandomNode(slot int) (*clusterNode, error) {
 	if len(nodes) == 0 {
 		return c.nodes.Random()
 	}
-	n := rand.Intn(len(nodes))
-	return nodes[n], nil
+	if len(nodes) == 1 {
+		return nodes[0], nil
+	}
+	randomNodes := rand.Perm(len(nodes))
+	for _, idx := range randomNodes {
+		if node := nodes[idx]; !node.Failing() {
+			return node, nil
+		}
+	}
+	return nodes[randomNodes[0]], nil
 }
 
 func (c *clusterState) slotNodes(slot int) []*clusterNode {
@@ -628,14 +654,14 @@ func (c *clusterStateHolder) Reload(ctx context.Context) (*clusterState, error) 
 	return state, nil
 }
 
-func (c *clusterStateHolder) LazyReload(ctx context.Context) {
+func (c *clusterStateHolder) LazyReload() {
 	if !atomic.CompareAndSwapUint32(&c.reloading, 0, 1) {
 		return
 	}
 	go func() {
 		defer atomic.StoreUint32(&c.reloading, 0)
 
-		_, err := c.Reload(ctx)
+		_, err := c.Reload(context.Background())
 		if err != nil {
 			return
 		}
@@ -645,14 +671,15 @@ func (c *clusterStateHolder) LazyReload(ctx context.Context) {
 
 func (c *clusterStateHolder) Get(ctx context.Context) (*clusterState, error) {
 	v := c.state.Load()
-	if v != nil {
-		state := v.(*clusterState)
-		if time.Since(state.createdAt) > 10*time.Second {
-			c.LazyReload(ctx)
-		}
-		return state, nil
+	if v == nil {
+		return c.Reload(ctx)
 	}
-	return c.Reload(ctx)
+
+	state := v.(*clusterState)
+	if time.Since(state.createdAt) > 10*time.Second {
+		c.LazyReload()
+	}
+	return state, nil
 }
 
 func (c *clusterStateHolder) ReloadOrGet(ctx context.Context) (*clusterState, error) {
@@ -679,7 +706,6 @@ type ClusterClient struct {
 	*clusterClient
 	cmdable
 	hooks
-	ctx context.Context
 }
 
 // NewClusterClient returns a Redis Cluster client as described in
@@ -692,32 +718,12 @@ func NewClusterClient(opt *ClusterOptions) *ClusterClient {
 			opt:   opt,
 			nodes: newClusterNodes(opt),
 		},
-		ctx: context.Background(),
 	}
 	c.state = newClusterStateHolder(c.loadState)
 	c.cmdsInfoCache = newCmdsInfoCache(c.cmdsInfo)
 	c.cmdable = c.Process
 
-	if opt.IdleCheckFrequency > 0 {
-		go c.reaper(opt.IdleCheckFrequency)
-	}
-
 	return c
-}
-
-func (c *ClusterClient) Context() context.Context {
-	return c.ctx
-}
-
-func (c *ClusterClient) WithContext(ctx context.Context) *ClusterClient {
-	if ctx == nil {
-		panic("nil context")
-	}
-	clone := *c
-	clone.cmdable = clone.Process
-	clone.hooks.lock()
-	clone.ctx = ctx
-	return &clone
 }
 
 // Options returns read-only Options that were used to create the client.
@@ -728,7 +734,7 @@ func (c *ClusterClient) Options() *ClusterOptions {
 // ReloadState reloads cluster state. If available it calls ClusterSlots func
 // to get cluster slots information.
 func (c *ClusterClient) ReloadState(ctx context.Context) {
-	c.state.LazyReload(ctx)
+	c.state.LazyReload()
 }
 
 // Close closes the cluster client, releasing any open resources.
@@ -751,8 +757,8 @@ func (c *ClusterClient) Process(ctx context.Context, cmd Cmder) error {
 }
 
 func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
-	cmdInfo := c.cmdInfo(cmd.Name())
-	slot := c.cmdSlot(cmd)
+	cmdInfo := c.cmdInfo(ctx, cmd.Name())
+	slot := c.cmdSlot(ctx, cmd)
 
 	var node *clusterNode
 	var ask bool
@@ -777,7 +783,6 @@ func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
 			_ = pipe.Process(ctx, NewCmd(ctx, "asking"))
 			_ = pipe.Process(ctx, cmd)
 			_, lastErr = pipe.Exec(ctx)
-			_ = pipe.Close()
 			ask = false
 		} else {
 			lastErr = node.Client.Process(ctx, cmd)
@@ -789,7 +794,7 @@ func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
 		}
 		if isReadOnly := isReadOnlyError(lastErr); isReadOnly || lastErr == pool.ErrClosed {
 			if isReadOnly {
-				c.state.LazyReload(ctx)
+				c.state.LazyReload()
 			}
 			node = nil
 			continue
@@ -806,8 +811,10 @@ func (c *ClusterClient) process(ctx context.Context, cmd Cmder) error {
 		var addr string
 		moved, ask, addr = isMovedError(lastErr)
 		if moved || ask {
+			c.state.LazyReload()
+
 			var err error
-			node, err = c.nodes.Get(addr)
+			node, err = c.nodes.GetOrCreate(addr)
 			if err != nil {
 				return err
 			}
@@ -1004,7 +1011,7 @@ func (c *ClusterClient) loadState(ctx context.Context) (*clusterState, error) {
 	for _, idx := range rand.Perm(len(addrs)) {
 		addr := addrs[idx]
 
-		node, err := c.nodes.Get(addr)
+		node, err := c.nodes.GetOrCreate(addr)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -1036,29 +1043,8 @@ func (c *ClusterClient) loadState(ctx context.Context) (*clusterState, error) {
 	return nil, firstErr
 }
 
-// reaper closes idle connections to the cluster.
-func (c *ClusterClient) reaper(idleCheckFrequency time.Duration) {
-	ticker := time.NewTicker(idleCheckFrequency)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		nodes, err := c.nodes.All()
-		if err != nil {
-			break
-		}
-
-		for _, node := range nodes {
-			_, err := node.Client.connPool.(*pool.ConnPool).ReapStaleConns()
-			if err != nil {
-				internal.Logger.Printf(c.Context(), "ReapStaleConns failed: %s", err)
-			}
-		}
-	}
-}
-
 func (c *ClusterClient) Pipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processPipeline,
 	}
 	pipe.init()
@@ -1127,9 +1113,9 @@ func (c *ClusterClient) mapCmdsByNode(ctx context.Context, cmdsMap *cmdsMap, cmd
 		return err
 	}
 
-	if c.opt.ReadOnly && c.cmdsAreReadOnly(cmds) {
+	if c.opt.ReadOnly && c.cmdsAreReadOnly(ctx, cmds) {
 		for _, cmd := range cmds {
-			slot := c.cmdSlot(cmd)
+			slot := c.cmdSlot(ctx, cmd)
 			node, err := c.slotReadOnlyNode(state, slot)
 			if err != nil {
 				return err
@@ -1140,7 +1126,7 @@ func (c *ClusterClient) mapCmdsByNode(ctx context.Context, cmdsMap *cmdsMap, cmd
 	}
 
 	for _, cmd := range cmds {
-		slot := c.cmdSlot(cmd)
+		slot := c.cmdSlot(ctx, cmd)
 		node, err := state.slotMasterNode(slot)
 		if err != nil {
 			return err
@@ -1150,9 +1136,9 @@ func (c *ClusterClient) mapCmdsByNode(ctx context.Context, cmdsMap *cmdsMap, cmd
 	return nil
 }
 
-func (c *ClusterClient) cmdsAreReadOnly(cmds []Cmder) bool {
+func (c *ClusterClient) cmdsAreReadOnly(ctx context.Context, cmds []Cmder) bool {
 	for _, cmd := range cmds {
-		cmdInfo := c.cmdInfo(cmd.Name())
+		cmdInfo := c.cmdInfo(ctx, cmd.Name())
 		if cmdInfo == nil || !cmdInfo.ReadOnly {
 			return false
 		}
@@ -1198,7 +1184,7 @@ func (c *ClusterClient) pipelineReadCmds(
 			continue
 		}
 
-		if c.opt.ReadOnly && isLoadingError(err) {
+		if c.opt.ReadOnly && (isLoadingError(err) || !isRedisError(err)) {
 			node.MarkAsFailing()
 			return err
 		}
@@ -1218,13 +1204,13 @@ func (c *ClusterClient) checkMovedErr(
 		return false
 	}
 
-	node, err := c.nodes.Get(addr)
+	node, err := c.nodes.GetOrCreate(addr)
 	if err != nil {
 		return false
 	}
 
 	if moved {
-		c.state.LazyReload(ctx)
+		c.state.LazyReload()
 		failedCmds.Add(node, cmd)
 		return true
 	}
@@ -1240,7 +1226,6 @@ func (c *ClusterClient) checkMovedErr(
 // TxPipeline acts like Pipeline, but wraps queued commands with MULTI/EXEC.
 func (c *ClusterClient) TxPipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processTxPipeline,
 	}
 	pipe.init()
@@ -1252,17 +1237,20 @@ func (c *ClusterClient) TxPipelined(ctx context.Context, fn func(Pipeliner) erro
 }
 
 func (c *ClusterClient) processTxPipeline(ctx context.Context, cmds []Cmder) error {
-	return c.hooks.processPipeline(ctx, cmds, c._processTxPipeline)
+	return c.hooks.processTxPipeline(ctx, cmds, c._processTxPipeline)
 }
 
 func (c *ClusterClient) _processTxPipeline(ctx context.Context, cmds []Cmder) error {
+	// Trim multi .. exec.
+	cmds = cmds[1 : len(cmds)-1]
+
 	state, err := c.state.Get(ctx)
 	if err != nil {
 		setCmdsErr(cmds, err)
 		return err
 	}
 
-	cmdsMap := c.mapCmdsBySlot(cmds)
+	cmdsMap := c.mapCmdsBySlot(ctx, cmds)
 	for slot, cmds := range cmdsMap {
 		node, err := state.slotMasterNode(slot)
 		if err != nil {
@@ -1291,6 +1279,7 @@ func (c *ClusterClient) _processTxPipeline(ctx context.Context, cmds []Cmder) er
 					if err == nil {
 						return
 					}
+
 					if attempt < c.opt.MaxRedirects {
 						if err := c.mapCmdsByNode(ctx, failedCmds, cmds); err != nil {
 							setCmdsErr(cmds, err)
@@ -1312,10 +1301,10 @@ func (c *ClusterClient) _processTxPipeline(ctx context.Context, cmds []Cmder) er
 	return cmdsFirstErr(cmds)
 }
 
-func (c *ClusterClient) mapCmdsBySlot(cmds []Cmder) map[int][]Cmder {
+func (c *ClusterClient) mapCmdsBySlot(ctx context.Context, cmds []Cmder) map[int][]Cmder {
 	cmdsMap := make(map[int][]Cmder)
 	for _, cmd := range cmds {
-		slot := c.cmdSlot(cmd)
+		slot := c.cmdSlot(ctx, cmd)
 		cmdsMap[slot] = append(cmdsMap[slot], cmd)
 	}
 	return cmdsMap
@@ -1382,12 +1371,7 @@ func (c *ClusterClient) txPipelineReadQueued(
 		return err
 	}
 
-	switch line[0] {
-	case proto.ErrorReply:
-		return proto.ParseErrorReply(line)
-	case proto.ArrayReply:
-		// ok
-	default:
+	if line[0] != proto.RespArray {
 		return fmt.Errorf("redis: expected '*', but got line %q", line)
 	}
 
@@ -1400,13 +1384,13 @@ func (c *ClusterClient) cmdsMoved(
 	addr string,
 	failedCmds *cmdsMap,
 ) error {
-	node, err := c.nodes.Get(addr)
+	node, err := c.nodes.GetOrCreate(addr)
 	if err != nil {
 		return err
 	}
 
 	if moved {
-		c.state.LazyReload(ctx)
+		c.state.LazyReload()
 		for _, cmd := range cmds {
 			failedCmds.Add(node, cmd)
 		}
@@ -1465,7 +1449,7 @@ func (c *ClusterClient) Watch(ctx context.Context, fn func(*Tx) error, keys ...s
 
 		moved, ask, addr := isMovedError(err)
 		if moved || ask {
-			node, err = c.nodes.Get(addr)
+			node, err = c.nodes.GetOrCreate(addr)
 			if err != nil {
 				return err
 			}
@@ -1474,7 +1458,7 @@ func (c *ClusterClient) Watch(ctx context.Context, fn func(*Tx) error, keys ...s
 
 		if isReadOnly := isReadOnlyError(err); isReadOnly || err == pool.ErrClosed {
 			if isReadOnly {
-				c.state.LazyReload(ctx)
+				c.state.LazyReload()
 			}
 			node, err = c.slotMasterNode(ctx, slot)
 			if err != nil {
@@ -1577,7 +1561,7 @@ func (c *ClusterClient) cmdsInfo(ctx context.Context) (map[string]*CommandInfo, 
 	for _, idx := range perm {
 		addr := addrs[idx]
 
-		node, err := c.nodes.Get(addr)
+		node, err := c.nodes.GetOrCreate(addr)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -1600,26 +1584,27 @@ func (c *ClusterClient) cmdsInfo(ctx context.Context) (map[string]*CommandInfo, 
 	return nil, firstErr
 }
 
-func (c *ClusterClient) cmdInfo(name string) *CommandInfo {
-	cmdsInfo, err := c.cmdsInfoCache.Get(c.ctx)
+func (c *ClusterClient) cmdInfo(ctx context.Context, name string) *CommandInfo {
+	cmdsInfo, err := c.cmdsInfoCache.Get(ctx)
 	if err != nil {
+		internal.Logger.Printf(context.TODO(), "getting command info: %s", err)
 		return nil
 	}
 
 	info := cmdsInfo[name]
 	if info == nil {
-		internal.Logger.Printf(c.Context(), "info for cmd=%s not found", name)
+		internal.Logger.Printf(context.TODO(), "info for cmd=%s not found", name)
 	}
 	return info
 }
 
-func (c *ClusterClient) cmdSlot(cmd Cmder) int {
+func (c *ClusterClient) cmdSlot(ctx context.Context, cmd Cmder) int {
 	args := cmd.Args()
 	if args[0] == "cluster" && args[1] == "getkeysinslot" {
 		return args[2].(int)
 	}
 
-	cmdInfo := c.cmdInfo(cmd.Name())
+	cmdInfo := c.cmdInfo(ctx, cmd.Name())
 	return cmdSlot(cmd, cmdFirstKeyPos(cmd, cmdInfo))
 }
 
@@ -1641,7 +1626,7 @@ func (c *ClusterClient) cmdNode(
 		return nil, err
 	}
 
-	if (c.opt.RouteByLatency || c.opt.RouteRandomly) && cmdInfo != nil && cmdInfo.ReadOnly {
+	if c.opt.ReadOnly && cmdInfo != nil && cmdInfo.ReadOnly {
 		return c.slotReadOnlyNode(state, slot)
 	}
 	return state.slotMasterNode(slot)
@@ -1663,6 +1648,35 @@ func (c *ClusterClient) slotMasterNode(ctx context.Context, slot int) (*clusterN
 		return nil, err
 	}
 	return state.slotMasterNode(slot)
+}
+
+// SlaveForKey gets a client for a replica node to run any command on it.
+// This is especially useful if we want to run a particular lua script which has
+// only read only commands on the replica.
+// This is because other redis commands generally have a flag that points that
+// they are read only and automatically run on the replica nodes
+// if ClusterOptions.ReadOnly flag is set to true.
+func (c *ClusterClient) SlaveForKey(ctx context.Context, key string) (*Client, error) {
+	state, err := c.state.Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	slot := hashtag.Slot(key)
+	node, err := c.slotReadOnlyNode(state, slot)
+	if err != nil {
+		return nil, err
+	}
+	return node.Client, err
+}
+
+// MasterForKey return a client to the master node for a particular key.
+func (c *ClusterClient) MasterForKey(ctx context.Context, key string) (*Client, error) {
+	slot := hashtag.Slot(key)
+	node, err := c.slotMasterNode(ctx, slot)
+	if err != nil {
+		return nil, err
+	}
+	return node.Client, err
 }
 
 func appendUniqueNode(nodes []*clusterNode, node *clusterNode) []*clusterNode {

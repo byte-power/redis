@@ -12,11 +12,12 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
-	"github.com/dgryski/go-rendezvous"
-	"github.com/go-redis/redis/v8/internal"
-	"github.com/go-redis/redis/v8/internal/hashtag"
-	"github.com/go-redis/redis/v8/internal/pool"
-	"github.com/go-redis/redis/v8/internal/rand"
+	rendezvous "github.com/dgryski/go-rendezvous" //nolint
+
+	"github.com/go-redis/redis/v9/internal"
+	"github.com/go-redis/redis/v9/internal/hashtag"
+	"github.com/go-redis/redis/v9/internal/pool"
+	"github.com/go-redis/redis/v9/internal/rand"
 )
 
 var errRingShardsDown = errors.New("redis: all ring shards are down")
@@ -78,12 +79,15 @@ type RingOptions struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
-	PoolSize           int
-	MinIdleConns       int
-	MaxConnAge         time.Duration
-	PoolTimeout        time.Duration
-	IdleTimeout        time.Duration
-	IdleCheckFrequency time.Duration
+	// PoolFIFO uses FIFO mode for each node connection pool GET/PUT (default LIFO).
+	PoolFIFO bool
+
+	PoolSize        int
+	PoolTimeout     time.Duration
+	MinIdleConns    int
+	MaxIdleConns    int
+	ConnMaxIdleTime time.Duration
+	ConnMaxLifetime time.Duration
 
 	TLSConfig *tls.Config
 	Limiter   Limiter
@@ -138,12 +142,13 @@ func (opt *RingOptions) clientOptions() *Options {
 		ReadTimeout:  opt.ReadTimeout,
 		WriteTimeout: opt.WriteTimeout,
 
-		PoolSize:           opt.PoolSize,
-		MinIdleConns:       opt.MinIdleConns,
-		MaxConnAge:         opt.MaxConnAge,
-		PoolTimeout:        opt.PoolTimeout,
-		IdleTimeout:        opt.IdleTimeout,
-		IdleCheckFrequency: opt.IdleCheckFrequency,
+		PoolFIFO:        opt.PoolFIFO,
+		PoolSize:        opt.PoolSize,
+		PoolTimeout:     opt.PoolTimeout,
+		MinIdleConns:    opt.MinIdleConns,
+		MaxIdleConns:    opt.MaxIdleConns,
+		ConnMaxIdleTime: opt.ConnMaxIdleTime,
+		ConnMaxLifetime: opt.ConnMaxLifetime,
 
 		TLSConfig: opt.TLSConfig,
 		Limiter:   opt.Limiter,
@@ -254,10 +259,11 @@ func (c *ringShards) Hash(key string) string {
 	var hash string
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	if c.numShard > 0 {
 		hash = c.hash.Get(key)
 	}
-	c.mu.RUnlock()
 
 	return hash
 }
@@ -266,27 +272,22 @@ func (c *ringShards) GetByKey(key string) (*ringShard, error) {
 	key = hashtag.Key(key)
 
 	c.mu.RLock()
+	defer c.mu.RUnlock()
 
 	if c.closed {
-		c.mu.RUnlock()
 		return nil, pool.ErrClosed
 	}
 
 	if c.numShard == 0 {
-		c.mu.RUnlock()
 		return nil, errRingShardsDown
 	}
 
 	hash := c.hash.Get(key)
 	if hash == "" {
-		c.mu.RUnlock()
 		return nil, errRingShardsDown
 	}
 
-	shard := c.shards[hash]
-	c.mu.RUnlock()
-
-	return shard, nil
+	return c.shards[hash], nil
 }
 
 func (c *ringShards) GetByName(shardName string) (*ringShard, error) {
@@ -295,35 +296,39 @@ func (c *ringShards) GetByName(shardName string) (*ringShard, error) {
 	}
 
 	c.mu.RLock()
-	shard := c.shards[shardName]
-	c.mu.RUnlock()
-	return shard, nil
+	defer c.mu.RUnlock()
+
+	return c.shards[shardName], nil
 }
 
 func (c *ringShards) Random() (*ringShard, error) {
 	return c.GetByKey(strconv.Itoa(rand.Int()))
 }
 
-// heartbeat monitors state of each shard in the ring.
-func (c *ringShards) Heartbeat(frequency time.Duration) {
+// Heartbeat monitors state of each shard in the ring.
+func (c *ringShards) Heartbeat(ctx context.Context, frequency time.Duration) {
 	ticker := time.NewTicker(frequency)
 	defer ticker.Stop()
 
-	ctx := context.Background()
-	for range ticker.C {
-		var rebalance bool
+	for {
+		select {
+		case <-ticker.C:
+			var rebalance bool
 
-		for _, shard := range c.List() {
-			err := shard.Client.Ping(ctx).Err()
-			isUp := err == nil || err == pool.ErrPoolTimeout
-			if shard.Vote(isUp) {
-				internal.Logger.Printf(context.Background(), "ring shard state changed: %s", shard)
-				rebalance = true
+			for _, shard := range c.List() {
+				err := shard.Client.Ping(ctx).Err()
+				isUp := err == nil || err == pool.ErrPoolTimeout
+				if shard.Vote(isUp) {
+					internal.Logger.Printf(ctx, "ring shard state changed: %s", shard)
+					rebalance = true
+				}
 			}
-		}
 
-		if rebalance {
-			c.rebalance()
+			if rebalance {
+				c.rebalance()
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -352,9 +357,9 @@ func (c *ringShards) rebalance() {
 
 func (c *ringShards) Len() int {
 	c.mu.RLock()
-	l := c.numShard
-	c.mu.RUnlock()
-	return l
+	defer c.mu.RUnlock()
+
+	return c.numShard
 }
 
 func (c *ringShards) Close() error {
@@ -372,8 +377,10 @@ func (c *ringShards) Close() error {
 			firstErr = err
 		}
 	}
+
 	c.hash = nil
 	c.shards = nil
+	c.numShard = 0
 	c.list = nil
 
 	return firstErr
@@ -382,9 +389,10 @@ func (c *ringShards) Close() error {
 //------------------------------------------------------------------------------
 
 type ring struct {
-	opt           *RingOptions
-	shards        *ringShards
-	cmdsInfoCache *cmdsInfoCache //nolint:structcheck
+	opt               *RingOptions
+	shards            *ringShards
+	cmdsInfoCache     *cmdsInfoCache //nolint:structcheck
+	heartbeatCancelFn context.CancelFunc
 }
 
 // Ring is a Redis client that uses consistent hashing to distribute
@@ -405,41 +413,27 @@ type Ring struct {
 	*ring
 	cmdable
 	hooks
-	ctx context.Context
 }
 
 func NewRing(opt *RingOptions) *Ring {
 	opt.init()
 
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+
 	ring := Ring{
 		ring: &ring{
-			opt:    opt,
-			shards: newRingShards(opt),
+			opt:               opt,
+			shards:            newRingShards(opt),
+			heartbeatCancelFn: hbCancel,
 		},
-		ctx: context.Background(),
 	}
 
 	ring.cmdsInfoCache = newCmdsInfoCache(ring.cmdsInfo)
 	ring.cmdable = ring.Process
 
-	go ring.shards.Heartbeat(opt.HeartbeatFrequency)
+	go ring.shards.Heartbeat(hbCtx, opt.HeartbeatFrequency)
 
 	return &ring
-}
-
-func (c *Ring) Context() context.Context {
-	return c.ctx
-}
-
-func (c *Ring) WithContext(ctx context.Context) *Ring {
-	if ctx == nil {
-		panic("nil context")
-	}
-	clone := *c
-	clone.cmdable = clone.Process
-	clone.hooks.lock()
-	clone.ctx = ctx
-	return &clone
 }
 
 // Do creates a Cmd from the args and processes the cmd.
@@ -571,7 +565,7 @@ func (c *Ring) cmdInfo(ctx context.Context, name string) *CommandInfo {
 	}
 	info := cmdsInfo[name]
 	if info == nil {
-		internal.Logger.Printf(c.Context(), "info for cmd=%s not found", name)
+		internal.Logger.Printf(ctx, "info for cmd=%s not found", name)
 	}
 	return info
 }
@@ -614,7 +608,6 @@ func (c *Ring) Pipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmder
 
 func (c *Ring) Pipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processPipeline,
 	}
 	pipe.init()
@@ -633,7 +626,6 @@ func (c *Ring) TxPipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmd
 
 func (c *Ring) TxPipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processTxPipeline,
 	}
 	pipe.init()
@@ -727,5 +719,7 @@ func (c *Ring) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) er
 // It is rare to Close a Ring, as the Ring is meant to be long-lived
 // and shared between many goroutines.
 func (c *Ring) Close() error {
+	c.heartbeatCancelFn()
+
 	return c.shards.Close()
 }

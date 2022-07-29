@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	"github.com/go-redis/redis/v9"
 )
 
 type redisHookError struct {
@@ -136,17 +136,6 @@ var _ = Describe("Client", func() {
 		Expect(client.Ping(ctx).Err()).NotTo(HaveOccurred())
 	})
 
-	It("should close pipeline without closing the client", func() {
-		pipeline := client.Pipeline()
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
-
-		pipeline.Ping(ctx)
-		_, err := pipeline.Exec(ctx)
-		Expect(err).To(MatchError("redis: client is closed"))
-
-		Expect(client.Ping(ctx).Err()).NotTo(HaveOccurred())
-	})
-
 	It("should close pubsub when client is closed", func() {
 		pubsub := client.Subscribe(ctx)
 		Expect(client.Close()).NotTo(HaveOccurred())
@@ -155,12 +144,6 @@ var _ = Describe("Client", func() {
 		Expect(err).To(MatchError("redis: client is closed"))
 
 		Expect(pubsub.Close()).NotTo(HaveOccurred())
-	})
-
-	It("should close pipeline when client is closed", func() {
-		pipeline := client.Pipeline()
-		Expect(client.Close()).NotTo(HaveOccurred())
-		Expect(pipeline.Close()).NotTo(HaveOccurred())
 	})
 
 	It("should select DB", func() {
@@ -243,12 +226,16 @@ var _ = Describe("Client", func() {
 		cn, err := client.Pool().Get(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cn.UsedAt).NotTo(BeZero())
+
+		// set cn.SetUsedAt(time) or time.Sleep(>1*time.Second)
+		// simulate the last time Conn was used
+		// time.Sleep() is not the standard sleep time
+		// link: https://go-review.googlesource.com/c/go/+/232298
+		cn.SetUsedAt(time.Now().Add(-1 * time.Second))
 		createdAt := cn.UsedAt()
 
 		client.Pool().Put(ctx, cn)
 		Expect(cn.UsedAt().Equal(createdAt)).To(BeTrue())
-
-		time.Sleep(time.Second)
 
 		err = client.Ping(ctx).Err()
 		Expect(err).NotTo(HaveOccurred())
@@ -286,19 +273,43 @@ var _ = Describe("Client", func() {
 
 	It("should set and scan time", func() {
 		tm := time.Now()
-		err := rdb.Set(ctx, "now", tm, 0).Err()
+		err := client.Set(ctx, "now", tm, 0).Err()
 		Expect(err).NotTo(HaveOccurred())
 
 		var tm2 time.Time
-		err = rdb.Get(ctx, "now").Scan(&tm2)
+		err = client.Get(ctx, "now").Scan(&tm2)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(tm2).To(BeTemporally("==", tm))
 	})
 
+	It("should set and scan durations", func() {
+		duration := 10 * time.Minute
+		err := client.Set(ctx, "duration", duration, 0).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		var duration2 time.Duration
+		err = client.Get(ctx, "duration").Scan(&duration2)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(duration2).To(Equal(duration))
+	})
+
 	It("should Conn", func() {
-		err := rdb.Conn(ctx).Get(ctx, "this-key-does-not-exist").Err()
+		err := client.Conn().Get(ctx, "this-key-does-not-exist").Err()
 		Expect(err).To(Equal(redis.Nil))
+	})
+
+	It("should set and scan net.IP", func() {
+		ip := net.ParseIP("192.168.1.1")
+		err := client.Set(ctx, "ip", ip, 0).Err()
+		Expect(err).NotTo(HaveOccurred())
+
+		var ip2 net.IP
+		err = client.Get(ctx, "ip").Scan(&ip2)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(ip2).To(Equal(ip))
 	})
 })
 

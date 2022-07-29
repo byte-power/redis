@@ -4,16 +4,17 @@ import (
 	"encoding"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"time"
 
-	"github.com/go-redis/redis/v8/internal/util"
+	"github.com/go-redis/redis/v9/internal/util"
 )
 
 type writer interface {
 	io.Writer
 	io.ByteWriter
-	// io.StringWriter
+	// WriteString implement io.StringWriter.
 	WriteString(s string) (n int, err error)
 }
 
@@ -34,7 +35,7 @@ func NewWriter(wr writer) *Writer {
 }
 
 func (w *Writer) WriteArgs(args []interface{}) error {
-	if err := w.WriteByte(ArrayReply); err != nil {
+	if err := w.WriteByte(RespArray); err != nil {
 		return err
 	}
 
@@ -98,12 +99,16 @@ func (w *Writer) WriteArg(v interface{}) error {
 	case time.Time:
 		w.numBuf = v.AppendFormat(w.numBuf[:0], time.RFC3339Nano)
 		return w.bytes(w.numBuf)
+	case time.Duration:
+		return w.int(v.Nanoseconds())
 	case encoding.BinaryMarshaler:
 		b, err := v.MarshalBinary()
 		if err != nil {
 			return err
 		}
 		return w.bytes(b)
+	case net.IP:
+		return w.bytes(v)
 	default:
 		return fmt.Errorf(
 			"redis: can't marshal %T (implement encoding.BinaryMarshaler)", v)
@@ -111,7 +116,7 @@ func (w *Writer) WriteArg(v interface{}) error {
 }
 
 func (w *Writer) bytes(b []byte) error {
-	if err := w.WriteByte(StringReply); err != nil {
+	if err := w.WriteByte(RespString); err != nil {
 		return err
 	}
 

@@ -6,8 +6,9 @@ import (
 	"net"
 	"strings"
 
-	"github.com/go-redis/redis/v8/internal/hashtag"
-	"github.com/go-redis/redis/v8/internal/pool"
+	"github.com/go-redis/redis/v9/internal"
+	"github.com/go-redis/redis/v9/internal/hashtag"
+	"github.com/go-redis/redis/v9/internal/pool"
 )
 
 func (c *baseClient) Pool() pool.Pooler {
@@ -59,21 +60,21 @@ func (c *ClusterClient) SwapNodes(ctx context.Context, key string) error {
 	return nil
 }
 
-func (state *clusterState) IsConsistent(ctx context.Context) bool {
-	if len(state.Masters) < 3 {
+func (c *clusterState) IsConsistent(ctx context.Context) bool {
+	if len(c.Masters) < 3 {
 		return false
 	}
-	for _, master := range state.Masters {
+	for _, master := range c.Masters {
 		s := master.Client.Info(ctx, "replication").Val()
 		if !strings.Contains(s, "role:master") {
 			return false
 		}
 	}
 
-	if len(state.Slaves) < 3 {
+	if len(c.Slaves) < 3 {
 		return false
 	}
-	for _, slave := range state.Slaves {
+	for _, slave := range c.Slaves {
 		s := slave.Client.Info(ctx, "replication").Val()
 		if !strings.Contains(s, "role:slave") {
 			return false
@@ -81,4 +82,14 @@ func (state *clusterState) IsConsistent(ctx context.Context) bool {
 	}
 
 	return true
+}
+
+func GetSlavesAddrByName(ctx context.Context, c *SentinelClient, name string) []string {
+	addrs, err := c.Replicas(ctx, name).Result()
+	if err != nil {
+		internal.Logger.Printf(ctx, "sentinel: Replicas name=%q failed: %s",
+			name, err)
+		return []string{}
+	}
+	return parseReplicaAddrs(addrs, false)
 }

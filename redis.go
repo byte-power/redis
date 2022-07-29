@@ -4,20 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis/v8/internal"
-	"github.com/go-redis/redis/v8/internal/hashtag"
-	"github.com/go-redis/redis/v8/internal/pool"
-	"github.com/go-redis/redis/v8/internal/proto"
-	"go.opentelemetry.io/otel/label"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/go-redis/redis/v9/internal"
+	"github.com/go-redis/redis/v9/internal/hashtag"
+	"github.com/go-redis/redis/v9/internal/pool"
+	"github.com/go-redis/redis/v9/internal/proto"
 )
 
 // Nil reply returned by Redis when key does not exist.
 const Nil = proto.Nil
 
+// SetLogger set custom log
 func SetLogger(logger internal.Logging) {
 	internal.Logger = logger
 }
@@ -54,9 +54,7 @@ func (hs hooks) process(
 	ctx context.Context, cmd Cmder, fn func(context.Context, Cmder) error,
 ) error {
 	if len(hs.hooks) == 0 {
-		err := hs.withContext(ctx, func() error {
-			return fn(ctx, cmd)
-		})
+		err := fn(ctx, cmd)
 		cmd.SetErr(err)
 		return err
 	}
@@ -72,9 +70,7 @@ func (hs hooks) process(
 	}
 
 	if retErr == nil {
-		retErr = hs.withContext(ctx, func() error {
-			return fn(ctx, cmd)
-		})
+		retErr = fn(ctx, cmd)
 		cmd.SetErr(retErr)
 	}
 
@@ -92,9 +88,7 @@ func (hs hooks) processPipeline(
 	ctx context.Context, cmds []Cmder, fn func(context.Context, []Cmder) error,
 ) error {
 	if len(hs.hooks) == 0 {
-		err := hs.withContext(ctx, func() error {
-			return fn(ctx, cmds)
-		})
+		err := fn(ctx, cmds)
 		return err
 	}
 
@@ -109,9 +103,7 @@ func (hs hooks) processPipeline(
 	}
 
 	if retErr == nil {
-		retErr = hs.withContext(ctx, func() error {
-			return fn(ctx, cmds)
-		})
+		retErr = fn(ctx, cmds)
 	}
 
 	for hookIndex--; hookIndex >= 0; hookIndex-- {
@@ -129,10 +121,6 @@ func (hs hooks) processTxPipeline(
 ) error {
 	cmds = wrapMultiExec(ctx, cmds)
 	return hs.processPipeline(ctx, cmds, fn)
-}
-
-func (hs hooks) withContext(ctx context.Context, fn func() error) error {
-	return fn()
 }
 
 //------------------------------------------------------------------------------
@@ -215,10 +203,7 @@ func (c *baseClient) _getConn(ctx context.Context) (*pool.Conn, error) {
 		return cn, nil
 	}
 
-	err = internal.WithSpan(ctx, "redis.init_conn", func(ctx context.Context, span trace.Span) error {
-		return c.initConn(ctx, cn)
-	})
-	if err != nil {
+	if err := c.initConn(ctx, cn); err != nil {
 		c.connPool.Remove(ctx, cn, err)
 		if err := errors.Unwrap(err); err != nil {
 			return nil, err
@@ -235,22 +220,30 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	}
 	cn.Inited = true
 
-	if c.opt.Password == "" &&
-		c.opt.DB == 0 &&
-		!c.opt.readOnly &&
-		c.opt.OnConnect == nil {
-		return nil
+	username, password := c.opt.Username, c.opt.Password
+	if c.opt.CredentialsProvider != nil {
+		username, password = c.opt.CredentialsProvider()
 	}
 
 	connPool := pool.NewSingleConnPool(c.connPool, cn)
-	conn := newConn(ctx, c.opt, connPool)
+	conn := newConn(c.opt, connPool)
+
+	var auth bool
+
+	// For redis-server < 6.0 that does not support the Hello command,
+	// we continue to provide services with RESP2.
+	if err := conn.Hello(ctx, 3, username, password, "").Err(); err == nil {
+		auth = true
+	} else if !strings.HasPrefix(err.Error(), "ERR unknown command") {
+		return err
+	}
 
 	_, err := conn.Pipelined(ctx, func(pipe Pipeliner) error {
-		if c.opt.Password != "" {
-			if c.opt.Username != "" {
-				pipe.AuthACL(ctx, c.opt.Username, c.opt.Password)
+		if !auth && password != "" {
+			if username != "" {
+				pipe.AuthACL(ctx, username, password)
 			} else {
-				pipe.Auth(ctx, c.opt.Password)
+				pipe.Auth(ctx, password)
 			}
 		}
 
@@ -279,7 +272,7 @@ func (c *baseClient) releaseConn(ctx context.Context, cn *pool.Conn, err error) 
 		c.opt.Limiter.ReportResult(err)
 	}
 
-	if isBadConn(err, false) {
+	if isBadConn(err, false, c.opt.Addr) {
 		c.connPool.Remove(ctx, cn, err)
 	} else {
 		c.connPool.Put(ctx, cn)
@@ -289,43 +282,36 @@ func (c *baseClient) releaseConn(ctx context.Context, cn *pool.Conn, err error) 
 func (c *baseClient) withConn(
 	ctx context.Context, fn func(context.Context, *pool.Conn) error,
 ) error {
-	return internal.WithSpan(ctx, "redis.with_conn", func(ctx context.Context, span trace.Span) error {
-		cn, err := c.getConn(ctx)
-		if err != nil {
-			return err
-		}
+	cn, err := c.getConn(ctx)
+	if err != nil {
+		return err
+	}
 
-		if span.IsRecording() {
-			if remoteAddr := cn.RemoteAddr(); remoteAddr != nil {
-				span.SetAttributes(label.String("net.peer.ip", remoteAddr.String()))
-			}
-		}
+	defer func() {
+		c.releaseConn(ctx, cn, err)
+	}()
 
-		defer func() {
-			c.releaseConn(ctx, cn, err)
-		}()
+	done := ctx.Done() //nolint:ifshort
 
-		done := ctx.Done()
-		if done == nil {
-			err = fn(ctx, cn)
-			return err
-		}
+	if done == nil {
+		err = fn(ctx, cn)
+		return err
+	}
 
-		errc := make(chan error, 1)
-		go func() { errc <- fn(ctx, cn) }()
+	errc := make(chan error, 1)
+	go func() { errc <- fn(ctx, cn) }()
 
-		select {
-		case <-done:
-			_ = cn.Close()
-			// Wait for the goroutine to finish and send something.
-			<-errc
+	select {
+	case <-done:
+		_ = cn.Close()
+		// Wait for the goroutine to finish and send something.
+		<-errc
 
-			err = ctx.Err()
-			return err
-		case err = <-errc:
-			return err
-		}
-	})
+		err = ctx.Err()
+		return err
+	case err = <-errc:
+		return err
+	}
 }
 
 func (c *baseClient) process(ctx context.Context, cmd Cmder) error {
@@ -333,45 +319,48 @@ func (c *baseClient) process(ctx context.Context, cmd Cmder) error {
 	for attempt := 0; attempt <= c.opt.MaxRetries; attempt++ {
 		attempt := attempt
 
-		var retry bool
-		err := internal.WithSpan(ctx, "redis.process", func(ctx context.Context, span trace.Span) error {
-			if attempt > 0 {
-				if err := internal.Sleep(ctx, c.retryBackoff(attempt)); err != nil {
-					return err
-				}
-			}
-
-			retryTimeout := uint32(1)
-			err := c.withConn(ctx, func(ctx context.Context, cn *pool.Conn) error {
-				err := cn.WithWriter(ctx, c.opt.WriteTimeout, func(wr *proto.Writer) error {
-					return writeCmd(wr, cmd)
-				})
-				if err != nil {
-					return err
-				}
-
-				err = cn.WithReader(ctx, c.cmdTimeout(cmd), cmd.readReply)
-				if err != nil {
-					if cmd.readTimeout() == nil {
-						atomic.StoreUint32(&retryTimeout, 1)
-					}
-					return err
-				}
-
-				return nil
-			})
-			if err == nil {
-				return nil
-			}
-			retry = shouldRetry(err, atomic.LoadUint32(&retryTimeout) == 1)
-			return err
-		})
+		retry, err := c._process(ctx, cmd, attempt)
 		if err == nil || !retry {
 			return err
 		}
+
 		lastErr = err
 	}
 	return lastErr
+}
+
+func (c *baseClient) _process(ctx context.Context, cmd Cmder, attempt int) (bool, error) {
+	if attempt > 0 {
+		if err := internal.Sleep(ctx, c.retryBackoff(attempt)); err != nil {
+			return false, err
+		}
+	}
+
+	retryTimeout := uint32(1)
+	err := c.withConn(ctx, func(ctx context.Context, cn *pool.Conn) error {
+		err := cn.WithWriter(ctx, c.opt.WriteTimeout, func(wr *proto.Writer) error {
+			return writeCmd(wr, cmd)
+		})
+		if err != nil {
+			return err
+		}
+
+		err = cn.WithReader(ctx, c.cmdTimeout(cmd), cmd.readReply)
+		if err != nil {
+			if cmd.readTimeout() == nil {
+				atomic.StoreUint32(&retryTimeout, 1)
+			}
+			return err
+		}
+
+		return nil
+	})
+	if err == nil {
+		return false, nil
+	}
+
+	retry := shouldRetry(err, atomic.LoadUint32(&retryTimeout) == 1)
+	return retry, err
 }
 
 func (c *baseClient) retryBackoff(attempt int) time.Duration {
@@ -519,11 +508,12 @@ func wrapMultiExec(ctx context.Context, cmds []Cmder) []Cmder {
 }
 
 func txPipelineReadQueued(rd *proto.Reader, statusCmd *StatusCmd, cmds []Cmder) error {
-	// Parse queued replies.
+	// Parse +OK.
 	if err := statusCmd.readReply(rd); err != nil {
 		return err
 	}
 
+	// Parse +QUEUED.
 	for range cmds {
 		if err := statusCmd.readReply(rd); err != nil && !isRedisError(err) {
 			return err
@@ -539,14 +529,8 @@ func txPipelineReadQueued(rd *proto.Reader, statusCmd *StatusCmd, cmds []Cmder) 
 		return err
 	}
 
-	switch line[0] {
-	case proto.ErrorReply:
-		return proto.ParseErrorReply(line)
-	case proto.ArrayReply:
-		// ok
-	default:
-		err := fmt.Errorf("redis: expected '*', but got line %q", line)
-		return err
+	if line[0] != proto.RespArray {
+		return fmt.Errorf("redis: expected '*', but got line %q", line)
 	}
 
 	return nil
@@ -554,14 +538,15 @@ func txPipelineReadQueued(rd *proto.Reader, statusCmd *StatusCmd, cmds []Cmder) 
 
 //------------------------------------------------------------------------------
 
-// Client is a Redis client representing a pool of zero or more
-// underlying connections. It's safe for concurrent use by multiple
-// goroutines.
+// Client is a Redis client representing a pool of zero or more underlying connections.
+// It's safe for concurrent use by multiple goroutines.
+//
+// Client creates and frees connections automatically; it also maintains a free pool
+// of idle connections. You can control the pool size with Config.PoolSize option.
 type Client struct {
 	*baseClient
 	cmdable
 	hooks
-	ctx context.Context
 }
 
 // NewClient returns a client to the Redis Server specified by Options.
@@ -570,7 +555,6 @@ func NewClient(opt *Options) *Client {
 
 	c := Client{
 		baseClient: newBaseClient(opt, newConnPool(opt)),
-		ctx:        context.Background(),
 	}
 	c.cmdable = c.Process
 
@@ -590,21 +574,8 @@ func (c *Client) WithTimeout(timeout time.Duration) *Client {
 	return clone
 }
 
-func (c *Client) Context() context.Context {
-	return c.ctx
-}
-
-func (c *Client) WithContext(ctx context.Context) *Client {
-	if ctx == nil {
-		panic("nil context")
-	}
-	clone := c.clone()
-	clone.ctx = ctx
-	return clone
-}
-
-func (c *Client) Conn(ctx context.Context) *Conn {
-	return newConn(ctx, c.opt, pool.NewStickyConnPool(c.connPool))
+func (c *Client) Conn() *Conn {
+	return newConn(c.opt, pool.NewStickyConnPool(c.connPool))
 }
 
 // Do creates a Cmd from the args and processes the cmd.
@@ -645,7 +616,6 @@ func (c *Client) Pipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmd
 
 func (c *Client) Pipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processPipeline,
 	}
 	pipe.init()
@@ -659,7 +629,6 @@ func (c *Client) TxPipelined(ctx context.Context, fn func(Pipeliner) error) ([]C
 // TxPipeline acts like Pipeline, but wraps queued commands with MULTI/EXEC.
 func (c *Client) TxPipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processTxPipeline,
 	}
 	pipe.init()
@@ -732,13 +701,14 @@ type conn struct {
 	hooks // TODO: inherit hooks
 }
 
-// Conn is like Client, but its pool contains single connection.
+// Conn represents a single Redis connection rather than a pool of connections.
+// Prefer running commands from Client unless there is a specific need
+// for a continuous single Redis connection.
 type Conn struct {
 	*conn
-	ctx context.Context
 }
 
-func newConn(ctx context.Context, opt *Options, connPool pool.Pooler) *Conn {
+func newConn(opt *Options, connPool pool.Pooler) *Conn {
 	c := Conn{
 		conn: &conn{
 			baseClient: baseClient{
@@ -746,7 +716,6 @@ func newConn(ctx context.Context, opt *Options, connPool pool.Pooler) *Conn {
 				connPool: connPool,
 			},
 		},
-		ctx: ctx,
 	}
 	c.cmdable = c.Process
 	c.statefulCmdable = c.Process
@@ -771,7 +740,6 @@ func (c *Conn) Pipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmder
 
 func (c *Conn) Pipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processPipeline,
 	}
 	pipe.init()
@@ -785,7 +753,6 @@ func (c *Conn) TxPipelined(ctx context.Context, fn func(Pipeliner) error) ([]Cmd
 // TxPipeline acts like Pipeline, but wraps queued commands with MULTI/EXEC.
 func (c *Conn) TxPipeline() Pipeliner {
 	pipe := Pipeline{
-		ctx:  c.ctx,
 		exec: c.processTxPipeline,
 	}
 	pipe.init()

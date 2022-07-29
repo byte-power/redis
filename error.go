@@ -6,10 +6,11 @@ import (
 	"net"
 	"strings"
 
-	"github.com/go-redis/redis/v8/internal/pool"
-	"github.com/go-redis/redis/v8/internal/proto"
+	"github.com/go-redis/redis/v9/internal/pool"
+	"github.com/go-redis/redis/v9/internal/proto"
 )
 
+// ErrClosed performs any operation on the closed client will return this error.
 var ErrClosed = pool.ErrClosed
 
 type Error interface {
@@ -64,7 +65,7 @@ func isRedisError(err error) bool {
 	return ok
 }
 
-func isBadConn(err error, allowTimeout bool) bool {
+func isBadConn(err error, allowTimeout bool, addr string) bool {
 	switch err {
 	case nil:
 		return false
@@ -73,14 +74,24 @@ func isBadConn(err error, allowTimeout bool) bool {
 	}
 
 	if isRedisError(err) {
-		// Close connections in read only state in case domain addr is used
-		// and domain resolves to a different Redis Server. See #790.
-		return isReadOnlyError(err)
+		switch {
+		case isReadOnlyError(err):
+			// Close connections in read only state in case domain addr is used
+			// and domain resolves to a different Redis Server. See #790.
+			return true
+		case isMovedSameConnAddr(err, addr):
+			// Close connections when we are asked to move to the same addr
+			// of the connection. Force a DNS resolution when all connections
+			// of the pool are recycled
+			return true
+		default:
+			return false
+		}
 	}
 
 	if allowTimeout {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return !netErr.Temporary()
+			return false
 		}
 	}
 
@@ -116,6 +127,14 @@ func isLoadingError(err error) bool {
 
 func isReadOnlyError(err error) bool {
 	return strings.HasPrefix(err.Error(), "READONLY ")
+}
+
+func isMovedSameConnAddr(err error, addr string) bool {
+	redisError := err.Error()
+	if !strings.HasPrefix(redisError, "MOVED ") {
+		return false
+	}
+	return strings.HasSuffix(redisError, " "+addr)
 }
 
 //------------------------------------------------------------------------------

@@ -3,14 +3,19 @@ package rediscensus
 import (
 	"context"
 
-	"github.com/go-redis/redis/extra/rediscmd"
-	"github.com/go-redis/redis/v8"
 	"go.opencensus.io/trace"
+
+	"github.com/go-redis/redis/extra/rediscmd/v9"
+	"github.com/go-redis/redis/v9"
 )
 
 type TracingHook struct{}
 
-var _ redis.Hook = TracingHook{}
+var _ redis.Hook = (*TracingHook)(nil)
+
+func NewTracingHook() *TracingHook {
+	return new(TracingHook)
+}
 
 func (TracingHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
 	ctx, span := trace.StartSpan(ctx, cmd.FullName())

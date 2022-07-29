@@ -25,6 +25,7 @@ type UniversalOptions struct {
 
 	Username         string
 	Password         string
+	SentinelUsername string
 	SentinelPassword string
 
 	MaxRetries      int
@@ -35,12 +36,15 @@ type UniversalOptions struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 
-	PoolSize           int
-	MinIdleConns       int
-	MaxConnAge         time.Duration
-	PoolTimeout        time.Duration
-	IdleTimeout        time.Duration
-	IdleCheckFrequency time.Duration
+	// PoolFIFO uses FIFO mode for each node connection pool GET/PUT (default LIFO).
+	PoolFIFO bool
+
+	PoolSize        int
+	PoolTimeout     time.Duration
+	MinIdleConns    int
+	MaxIdleConns    int
+	ConnMaxIdleTime time.Duration
+	ConnMaxLifetime time.Duration
 
 	TLSConfig *tls.Config
 
@@ -53,6 +57,7 @@ type UniversalOptions struct {
 
 	// The sentinel master name.
 	// Only failover clients.
+
 	MasterName string
 }
 
@@ -79,15 +84,18 @@ func (o *UniversalOptions) Cluster() *ClusterOptions {
 		MinRetryBackoff: o.MinRetryBackoff,
 		MaxRetryBackoff: o.MaxRetryBackoff,
 
-		DialTimeout:        o.DialTimeout,
-		ReadTimeout:        o.ReadTimeout,
-		WriteTimeout:       o.WriteTimeout,
-		PoolSize:           o.PoolSize,
-		MinIdleConns:       o.MinIdleConns,
-		MaxConnAge:         o.MaxConnAge,
-		PoolTimeout:        o.PoolTimeout,
-		IdleTimeout:        o.IdleTimeout,
-		IdleCheckFrequency: o.IdleCheckFrequency,
+		DialTimeout:  o.DialTimeout,
+		ReadTimeout:  o.ReadTimeout,
+		WriteTimeout: o.WriteTimeout,
+
+		PoolFIFO: o.PoolFIFO,
+
+		PoolSize:        o.PoolSize,
+		PoolTimeout:     o.PoolTimeout,
+		MinIdleConns:    o.MinIdleConns,
+		MaxIdleConns:    o.MaxIdleConns,
+		ConnMaxIdleTime: o.ConnMaxIdleTime,
+		ConnMaxLifetime: o.ConnMaxLifetime,
 
 		TLSConfig: o.TLSConfig,
 	}
@@ -109,6 +117,7 @@ func (o *UniversalOptions) Failover() *FailoverOptions {
 		DB:               o.DB,
 		Username:         o.Username,
 		Password:         o.Password,
+		SentinelUsername: o.SentinelUsername,
 		SentinelPassword: o.SentinelPassword,
 
 		MaxRetries:      o.MaxRetries,
@@ -119,12 +128,13 @@ func (o *UniversalOptions) Failover() *FailoverOptions {
 		ReadTimeout:  o.ReadTimeout,
 		WriteTimeout: o.WriteTimeout,
 
-		PoolSize:           o.PoolSize,
-		MinIdleConns:       o.MinIdleConns,
-		MaxConnAge:         o.MaxConnAge,
-		PoolTimeout:        o.PoolTimeout,
-		IdleTimeout:        o.IdleTimeout,
-		IdleCheckFrequency: o.IdleCheckFrequency,
+		PoolFIFO:        o.PoolFIFO,
+		PoolSize:        o.PoolSize,
+		PoolTimeout:     o.PoolTimeout,
+		MinIdleConns:    o.MinIdleConns,
+		MaxIdleConns:    o.MaxIdleConns,
+		ConnMaxIdleTime: o.ConnMaxIdleTime,
+		ConnMaxLifetime: o.ConnMaxLifetime,
 
 		TLSConfig: o.TLSConfig,
 	}
@@ -154,12 +164,13 @@ func (o *UniversalOptions) Simple() *Options {
 		ReadTimeout:  o.ReadTimeout,
 		WriteTimeout: o.WriteTimeout,
 
-		PoolSize:           o.PoolSize,
-		MinIdleConns:       o.MinIdleConns,
-		MaxConnAge:         o.MaxConnAge,
-		PoolTimeout:        o.PoolTimeout,
-		IdleTimeout:        o.IdleTimeout,
-		IdleCheckFrequency: o.IdleCheckFrequency,
+		PoolFIFO:        o.PoolFIFO,
+		PoolSize:        o.PoolSize,
+		PoolTimeout:     o.PoolTimeout,
+		MinIdleConns:    o.MinIdleConns,
+		MaxIdleConns:    o.MaxIdleConns,
+		ConnMaxIdleTime: o.ConnMaxIdleTime,
+		ConnMaxLifetime: o.ConnMaxLifetime,
 
 		TLSConfig: o.TLSConfig,
 	}
@@ -168,12 +179,11 @@ func (o *UniversalOptions) Simple() *Options {
 // --------------------------------------------------------------------
 
 // UniversalClient is an abstract client which - based on the provided options -
-// can connect to either clusters, or sentinel-backed failover instances
-// or simple single-instance servers. This can be useful for testing
-// cluster-specific applications locally.
+// represents either a ClusterClient, a FailoverClient, or a single-node Client.
+// This can be useful for testing cluster-specific applications locally or having different
+// clients in different environments.
 type UniversalClient interface {
 	Cmdable
-	Context() context.Context
 	AddHook(Hook)
 	Watch(ctx context.Context, fn func(*Tx) error, keys ...string) error
 	Do(ctx context.Context, args ...interface{}) *Cmd
@@ -190,12 +200,12 @@ var (
 	_ UniversalClient = (*Ring)(nil)
 )
 
-// NewUniversalClient returns a new multi client. The type of client returned depends
-// on the following three conditions:
+// NewUniversalClient returns a new multi client. The type of the returned client depends
+// on the following conditions:
 //
-// 1. if a MasterName is passed a sentinel-backed FailoverClient will be returned
-// 2. if the number of Addrs is two or more, a ClusterClient will be returned
-// 3. otherwise, a single-node redis Client will be returned.
+// 1. If the MasterName option is specified, a sentinel-backed FailoverClient is returned.
+// 2. if the number of Addrs is two or more, a ClusterClient is returned.
+// 3. Otherwise, a single-node Client is returned.
 func NewUniversalClient(opts *UniversalOptions) UniversalClient {
 	if opts.MasterName != "" {
 		return NewFailoverClient(opts.Failover())
