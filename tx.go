@@ -23,7 +23,7 @@ type Tx struct {
 	ctx context.Context
 }
 
-func (c *Client) newTx(ctx context.Context) *Tx {
+func (c *Client) NewTx(ctx context.Context) *Tx {
 	tx := Tx{
 		baseClient: baseClient{
 			opt:      c.opt,
@@ -65,7 +65,7 @@ func (c *Tx) Process(ctx context.Context, cmd Cmder) error {
 //
 // The transaction is automatically closed when fn exits.
 func (c *Client) Watch(ctx context.Context, fn func(*Tx) error, keys ...string) error {
-	tx := c.newTx(ctx)
+	tx := c.NewTx(ctx)
 	defer tx.Close(ctx)
 	if len(keys) > 0 {
 		if err := tx.Watch(ctx, keys...).Err(); err != nil {
